@@ -180,3 +180,153 @@ describe("CCM time filters — buildTimeFilters via cost_timeseries dispatch", (
     expect(before).toBe(Date.UTC(2025, 11, 31, 23, 59, 59, 999));
   });
 });
+<<<<<<< Updated upstream
+=======
+
+describe("CCM custom time window — start_time/end_time override across perspective resources", () => {
+  let registry: Registry;
+  let mockRequest: ReturnType<typeof vi.fn>;
+  let client: HarnessClient;
+
+  // A historical quarter the relative enum can't express: Q4 2025 (Oct 1 – Dec 31).
+  const Q4_START = Date.UTC(2025, 9, 1);           // 1759276800000
+  const Q4_END = Date.UTC(2025, 11, 31, 23, 59, 59, 999);
+
+  const MOCK_RESPONSE = { data: { perspectiveTimeSeriesStats: { stats: [] } } };
+  const FIXED_NOW = new Date("2026-05-21T12:00:00Z");
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(FIXED_NOW);
+    registry = new Registry(makeConfig({ HARNESS_TOOLSETS: "ccm" }));
+    mockRequest = vi.fn().mockResolvedValue(MOCK_RESPONSE);
+    client = makeClient(mockRequest);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function dispatchCustom(resourceType: string, extra: Record<string, unknown> = {}) {
+    await registry.dispatch(client, resourceType, "list", {
+      perspective_id: "test-perspective",
+      start_time: Q4_START,
+      end_time: Q4_END,
+      ...extra,
+    });
+    expect(mockRequest).toHaveBeenCalledOnce();
+    return extractTimeFilters(mockRequest.mock.calls[0][0] as Record<string, unknown>);
+  }
+
+  it("cost_timeseries honors start_time/end_time verbatim", async () => {
+    const { after, before } = await dispatchCustom("cost_timeseries", { time_resolution: "MONTH", group_by: "none" });
+    expect(after).toBe(Q4_START);
+    expect(before).toBe(Q4_END);
+  });
+
+  it("cost_breakdown honors start_time/end_time verbatim", async () => {
+    const { after, before } = await dispatchCustom("cost_breakdown", { group_by: "none" });
+    expect(after).toBe(Q4_START);
+    expect(before).toBe(Q4_END);
+  });
+
+  it("cost_summary honors start_time/end_time verbatim", async () => {
+    const { after, before } = await dispatchCustom("cost_summary");
+    expect(after).toBe(Q4_START);
+    expect(before).toBe(Q4_END);
+  });
+
+  it("custom window overrides an also-supplied time_filter", async () => {
+    const { after, before } = await dispatchCustom("cost_timeseries", {
+      time_filter: "LAST_30_DAYS",
+      time_resolution: "MONTH",
+      group_by: "none",
+    });
+    // Explicit epoch range wins over the relative enum.
+    expect(after).toBe(Q4_START);
+    expect(before).toBe(Q4_END);
+  });
+
+  it("accepts numeric-string epoch values (tool args often arrive as strings)", async () => {
+    await registry.dispatch(client, "cost_timeseries", "list", {
+      perspective_id: "test-perspective",
+      start_time: String(Q4_START),
+      end_time: String(Q4_END),
+      time_resolution: "MONTH",
+      group_by: "none",
+    });
+    const { after, before } = extractTimeFilters(mockRequest.mock.calls[0][0] as Record<string, unknown>);
+    expect(after).toBe(Q4_START);
+    expect(before).toBe(Q4_END);
+  });
+
+  it("falls back to relative time_filter when only one bound is provided", async () => {
+    await registry.dispatch(client, "cost_timeseries", "list", {
+      perspective_id: "test-perspective",
+      start_time: Q4_START, // end_time missing → not a valid custom window
+      time_filter: "LAST_MONTH",
+      time_resolution: "MONTH",
+      group_by: "none",
+    });
+    const { after, before } = extractTimeFilters(mockRequest.mock.calls[0][0] as Record<string, unknown>);
+    // LAST_MONTH relative to FIXED_NOW (May 2026) → April 2026.
+    expect(after).toBe(Date.UTC(2026, 3, 1));
+    expect(before).toBe(Date.UTC(2026, 3, 30, 23, 59, 59, 999));
+  });
+});
+
+describe("CCM group_by mapping — GenAI (identifier 'AI') and label fallback", () => {
+  let registry: Registry;
+  let mockRequest: ReturnType<typeof vi.fn>;
+  let client: HarnessClient;
+
+  const MOCK_RESPONSE = { data: { perspectiveGrid: { data: [] }, perspectiveTotalCount: 0 } };
+
+  beforeEach(() => {
+    registry = new Registry(makeConfig({ HARNESS_TOOLSETS: "ccm" }));
+    mockRequest = vi.fn().mockResolvedValue(MOCK_RESPONSE);
+    client = makeClient(mockRequest);
+  });
+
+  /** Pull the single entityGroupBy field object out of a cost_breakdown request. */
+  async function entityGroupBy(groupBy: string): Promise<Record<string, string>> {
+    await registry.dispatch(client, "cost_breakdown", "list", {
+      perspective_id: "test-perspective",
+      time_filter: "LAST_30_DAYS",
+      group_by: groupBy,
+    });
+    const call = mockRequest.mock.calls[0][0] as Record<string, unknown>;
+    const body = call.body as { variables: { groupBy: Array<{ entityGroupBy: Record<string, string> }> } };
+    return body.variables.groupBy[0].entityGroupBy;
+  }
+
+  // Each genAI fieldId must resolve to identifier "AI" with the CCM UI fieldName —
+  // NOT the LABEL_V2 fallback that caused the "No <field>" single-bucket bug.
+  const GENAI_CASES: Array<[string, string]> = [
+    ["genAIModel", "Model"],
+    ["genAIProvider", "Provider"],
+    ["genAIUsageType", "Token Type"],
+    ["genAIPrincipal", "Principal"],
+    ["genAIPrincipalId", "Principal Id"],
+    ["genAISubAccountId", "Sub Account ID"],
+    ["genAISubProvider", "Sub Provider"],
+  ];
+
+  for (const [fieldId, fieldName] of GENAI_CASES) {
+    it(`${fieldId} → entityGroupBy identifier 'AI' (fieldName '${fieldName}')`, async () => {
+      const gb = await entityGroupBy(fieldId);
+      expect(gb).toEqual({ fieldId, fieldName, identifier: "AI", identifierName: "AI" });
+    });
+  }
+
+  it("unknown field still falls through to the LABEL_V2 label-key mapping", async () => {
+    const gb = await entityGroupBy("team");
+    expect(gb).toEqual({
+      fieldId: "labels.value",
+      fieldName: "team",
+      identifier: "LABEL_V2",
+      identifierName: "Label V2",
+    });
+  });
+});
+>>>>>>> Stashed changes
