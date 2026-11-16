@@ -19,6 +19,11 @@ import {
   type HarnessYamlScope,
 } from "./entity-schema/live.js";
 import type { JsonObject } from "./entity-schema/normalize.js";
+import {
+  createGraphqlSchemaFetcher,
+  GRAPHQL_SCHEMA_RESOURCE_TYPE,
+  GRAPHQL_SCHEMA_TOOLSET,
+} from "./entity-schema/graphql.js";
 
 const log = createLogger("schema");
 
@@ -375,7 +380,13 @@ export function registerSchemaTool(
     : { ...SCHEMAS };
 
   const liveFetcher = client ? createLiveSchemaFetcher(client) : undefined;
-  const availableSchemas = listAvailableSchemaNames(Object.keys(allSchemas), liveFetcher);
+  // The CCM GraphQL schema is read over the API, so it needs a client and the ccm toolset.
+  const ccmEnabled = !_registry || _registry.getAllToolsets().some((t) => t.name === GRAPHQL_SCHEMA_TOOLSET);
+  const graphqlFetcher = client && ccmEnabled ? createGraphqlSchemaFetcher(client) : undefined;
+  const availableSchemas = [
+    ...listAvailableSchemaNames(Object.keys(allSchemas), liveFetcher),
+    ...(graphqlFetcher ? [GRAPHQL_SCHEMA_RESOURCE_TYPE] : []),
+  ];
   const hasLiveEntities = liveFetcher !== undefined;
 
   server.registerTool(
@@ -386,6 +397,9 @@ export function registerSchemaTool(
         "Pipeline/template schemas are bundled from harness-schema; connector, environment, service, " +
         "secret, and infrastructure schemas are fetched live from NG /yaml-schema (pass scope, org_id, project_id). " +
         "release_process and release_activity schemas are fetched live from /gateway/rmg/api/yamlSchema. " +
+        (graphqlFetcher
+          ? `${GRAPHQL_SCHEMA_RESOURCE_TYPE} is the CCM GraphQL schema: no path lists queries, path=<query or type name> expands one. `
+          : "") +
         "Use without path for a summary of fields and available sections. " +
         "Use with path to drill into a specific section. " +
         "Use with example to fetch a named example YAML snippet. " +
@@ -492,6 +506,19 @@ export function registerSchemaTool(
           return errorResult(
             "resource_type is required for schema lookups. Use example_search to search examples without specifying a resource type.",
           );
+        }
+
+        if (args.resource_type === GRAPHQL_SCHEMA_RESOURCE_TYPE) {
+          if (!graphqlFetcher) {
+            return errorResult(
+              "The CCM GraphQL schema needs an authenticated Harness client and the ccm toolset. Configure HARNESS_API_KEY and enable ccm.",
+            );
+          }
+          if (!args.path) {
+            return jsonResult(await graphqlFetcher.summary());
+          }
+          const found = await graphqlFetcher.item(args.path);
+          return found.ok ? jsonResult(found.result) : errorResult(found.message);
         }
 
         const isLive = liveFetcher?.isLiveEntity(args.resource_type) ?? false;
